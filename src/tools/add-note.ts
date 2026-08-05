@@ -57,24 +57,15 @@ export async function addNote(
 
     const target = findTargetSection(trip, args.day);
 
-    // Step 1: Insert the note block with placeholder text
-    const block = buildNoteBlock(userId);
+    // Insert the note and its text atomically. A two-step insert-then-edit can
+    // leave a blank note behind if another operation advances the version
+    // between the two submits.
+    const block = buildNoteBlock(userId, `${args.text}\n`);
     const insertIndex = target.section.blocks.length;
     const blockPath = ["itinerary", "sections", target.index, "blocks", insertIndex];
     const insertOps: Json0Op[] = [{ p: blockPath, li: block }];
 
     await submitOp(ctx, args.trip_key, insertOps);
-
-    // Step 2: Set the note text via rich-text subtype op
-    const textOps: Json0Op[] = [
-      {
-        p: [...blockPath, "text"],
-        t: "rich-text",
-        o: [{ insert: `${args.text}\n` }],
-      },
-    ];
-
-    await submitOp(ctx, args.trip_key, textOps);
 
     const preview = args.text.length > 60 ? `${args.text.slice(0, 57)}…` : args.text;
     const text = `Added note "${preview}" to ${target.label} in "${trip.title}".`;

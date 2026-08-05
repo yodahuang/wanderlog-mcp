@@ -32,6 +32,12 @@ describe("buildNoteBlock", () => {
     expect(typeof block.id).toBe("number");
   });
 
+  it("can initialize the note text for an atomic insert", () => {
+    expect(buildNoteBlock(42, "Arrival details\n").text).toEqual({
+      ops: [{ insert: "Arrival details\n" }],
+    });
+  });
+
   it("generates unique IDs across calls", () => {
     const ids = new Set(Array.from({ length: 50 }, () => buildNoteBlock(1).id));
     expect(ids.size).toBeGreaterThan(45);
