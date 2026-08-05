@@ -8,6 +8,7 @@ type CacheEntry = {
   version: number;
   geos: Geo[];
   listener?: (ops: Json0Op[], version: number) => void;
+  closedListener?: (code: number) => void;
 };
 
 /**
@@ -39,7 +40,13 @@ export class TripCache {
 
   private async ensureEntry(tripKey: string): Promise<CacheEntry> {
     const existing = this.entries.get(tripKey);
-    if (existing) return existing;
+    if (existing) {
+      const client = this.pool.get(tripKey);
+      // The close event normally removes the entry immediately. This check
+      // also covers a close that happened between event delivery and a read.
+      if (client.isSubscribed) return existing;
+      this.deleteEntry(tripKey);
+    }
 
     const pending = this.subscribing.get(tripKey);
     if (pending) return pending;
@@ -78,7 +85,21 @@ export class TripCache {
 
     client.on("remoteOp", listener);
 
-    const entry: CacheEntry = { snapshot, version: client.version, geos, listener };
+    const closedListener = () => {
+      const current = this.entries.get(tripKey);
+      if (current?.closedListener === closedListener) {
+        this.deleteEntry(tripKey);
+      }
+    };
+    client.on("closed", closedListener);
+
+    const entry: CacheEntry = {
+      snapshot,
+      version: client.version,
+      geos,
+      listener,
+      closedListener,
+    };
     this.entries.set(tripKey, entry);
 
     return entry;
@@ -101,13 +122,17 @@ export class TripCache {
       if (entry.listener) {
         const client = this.pool.get(tripKey);
         client.off("remoteOp", entry.listener);
+        if (entry.closedListener) client.off("closed", entry.closedListener);
       }
       this.entries.delete(tripKey);
     }
   }
 
   invalidate(tripKey: string): void {
+    const hadEntry = this.entries.has(tripKey);
     this.deleteEntry(tripKey);
+    // Otherwise ShareDBClient.subscribe() can return its old in-memory snapshot.
+    if (hadEntry) this.pool.get(tripKey).reset();
   }
 
   clear(): void {

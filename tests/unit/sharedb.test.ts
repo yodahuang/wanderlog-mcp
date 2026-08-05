@@ -2,6 +2,50 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ShareDBClient } from "../../src/transport/sharedb.ts";
 import { WanderlogAuthError, WanderlogError } from "../../src/errors.ts";
 
+const { FakeWebSocket } = vi.hoisted(() => {
+  class FakeWebSocket {
+    static readonly CONNECTING = 0;
+    static readonly OPEN = 1;
+    static readonly CLOSING = 2;
+    static readonly CLOSED = 3;
+
+    readyState = FakeWebSocket.CONNECTING;
+    private readonly listeners = new Map<
+      string,
+      Array<(...args: unknown[]) => void>
+    >();
+
+    on(event: string, listener: (...args: unknown[]) => void): this {
+      const listeners = this.listeners.get(event) ?? [];
+      listeners.push(listener);
+      this.listeners.set(event, listeners);
+      return this;
+    }
+
+    emit(event: string, ...args: unknown[]): void {
+      for (const listener of this.listeners.get(event) ?? []) {
+        listener(...args);
+      }
+    }
+
+    send(_data: string): void {}
+
+    terminate(): void {
+      this.readyState = FakeWebSocket.CLOSED;
+    }
+
+    close(): void {
+      this.readyState = FakeWebSocket.CLOSING;
+      this.emit("close", 1000);
+      this.readyState = FakeWebSocket.CLOSED;
+    }
+  }
+
+  return { FakeWebSocket };
+});
+
+vi.mock("ws", () => ({ default: FakeWebSocket }));
+
 describe("ShareDBClient reconnect logic", () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -85,6 +129,41 @@ describe("ShareDBClient reconnect logic", () => {
     expect((client as any).reconnectAttempts).toBe(0);
   });
 
+  it("rejects connect when the socket closes before the handshake", async () => {
+    const config = {
+      wsBaseUrl: "wss://test",
+      baseUrl: "https://test",
+      userAgent: "test",
+    } as any;
+    const client = new ShareDBClient(config, "tripA");
+    const pending = (client as any).doConnect();
+    const socket = (client as any).ws as InstanceType<typeof FakeWebSocket>;
+
+    socket.emit("close", 1006);
+
+    await expect(pending).rejects.toMatchObject({ code: "ws_closed" });
+    expect((client as any).ws).toBeUndefined();
+  });
+
+  it("retries one transient connection failure for the active caller", async () => {
+    const config = {
+      wsBaseUrl: "wss://test",
+      baseUrl: "https://test",
+      userAgent: "test",
+    } as any;
+    const client = new ShareDBClient(config, "tripA");
+    const doConnectSpy = vi
+      .spyOn(client as any, "doConnect")
+      .mockRejectedValueOnce(new Error("handshake failed"))
+      .mockResolvedValueOnce(undefined);
+
+    const promise = client.connect();
+    await vi.advanceTimersByTimeAsync(250);
+    await promise;
+
+    expect(doConnectSpy).toHaveBeenCalledTimes(2);
+  });
+
   it("logs a warning after N consecutive failures (reconnectAttempts > 5)", async () => {
     const config = {
       wsBaseUrl: "wss://test",
@@ -104,5 +183,64 @@ describe("ShareDBClient reconnect logic", () => {
     
     expect(consoleWarnSpy).toHaveBeenCalledTimes(1);
     expect(consoleWarnSpy.mock.calls[0]![0]).toContain("Reconnection has failed 6 times consecutively");
+  });
+
+  it("retries when reconnect resubscription rejects", async () => {
+    const config = {
+      wsBaseUrl: "wss://test",
+      baseUrl: "https://test",
+      userAgent: "test",
+    } as any;
+    const client = new ShareDBClient(config, "tripA");
+
+    vi.spyOn(client, "connect").mockResolvedValue(undefined);
+    const subscribeSpy = vi
+      .spyOn(client, "subscribe")
+      .mockRejectedValue(new Error("subscribe failed"));
+    const scheduleSpy = vi.spyOn(client as any, "scheduleReconnect");
+
+    (client as any).scheduleReconnect(true);
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(subscribeSpy).toHaveBeenCalledTimes(1);
+    expect(scheduleSpy).toHaveBeenCalledWith(true);
+    client.close();
+  });
+
+  it("does not let an old subscribe timeout reject a newer subscription", async () => {
+    const config = {
+      wsBaseUrl: "wss://test",
+      baseUrl: "https://test",
+      userAgent: "test",
+    } as any;
+    const client = new ShareDBClient(config, "tripA");
+    vi.spyOn(client, "connect").mockResolvedValue(undefined);
+    vi.spyOn(client as any, "send").mockImplementation(() => {});
+
+    const first = client.subscribe();
+    await Promise.resolve();
+    await Promise.resolve();
+    (client as any).failAllPending(new Error("socket closed"));
+    await expect(first).rejects.toThrow("socket closed");
+    expect(vi.getTimerCount()).toBe(0);
+
+    const second = client.subscribe();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect((client as any).subscribePending).toBeDefined();
+    expect(vi.getTimerCount()).toBe(1);
+
+    // The second request remains the only active timer after the first one
+    // was rejected and cleaned up.
+    await vi.advanceTimersByTimeAsync(9_999);
+    const snapshot = { title: "Trip", itinerary: { sections: [] } } as any;
+    (client as any).handleFrame(
+      { a: "s", c: "TripPlans", d: "tripA", data: { v: 1, data: snapshot } },
+      undefined as unknown as NodeJS.Timeout,
+      () => {},
+    );
+
+    await expect(second).resolves.toBe(snapshot);
+    client.close();
   });
 });

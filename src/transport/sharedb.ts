@@ -42,6 +42,14 @@ type OpFrame = {
 
 type Frame = InitFrame | HandshakeAckFrame | SubscribeAckFrame | OpFrame;
 
+type PendingSubscribe = {
+  resolve: (ack: SubscribeAckFrame) => void;
+  reject: (err: Error) => void;
+  timer: NodeJS.Timeout;
+};
+
+const CONNECT_RETRY_DELAY_MS = 250;
+
 export interface ShareDBClient {
   /** Fired when a remote op (not one we submitted) is received. */
   on(event: "remoteOp", listener: (ops: Json0Op[], version: number) => void): this;
@@ -66,10 +74,8 @@ export class ShareDBClient extends EventEmitter {
   private snapshot?: TripPlan;
   private _version = 0;
   private subscribed = false;
-  private subscribePending?: {
-    resolve: (ack: SubscribeAckFrame) => void;
-    reject: (err: Error) => void;
-  };
+  private subscribePending?: PendingSubscribe;
+  private subscribePromise?: Promise<TripPlan>;
   private readonly pendingOps = new Map<
     number,
     { resolve: () => void; reject: (err: Error) => void; timer: NodeJS.Timeout }
@@ -103,13 +109,50 @@ export class ShareDBClient extends EventEmitter {
   }
 
   async connect(): Promise<void> {
-    if (this.handshakeComplete) return;
+    if (
+      this.handshakeComplete &&
+      this.ws?.readyState === WebSocket.OPEN
+    ) {
+      return;
+    }
     if (this.connectPromise) return this.connectPromise;
-    this.connectPromise = this.doConnect();
+
+    // An explicit caller retry should take over from a delayed background
+    // reconnect instead of creating a second socket later.
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+    }
+
+    this.connectPromise = this.connectWithRetry();
     try {
       await this.connectPromise;
     } finally {
       this.connectPromise = undefined;
+    }
+  }
+
+  private async connectWithRetry(): Promise<void> {
+    let attempt = 0;
+    for (;;) {
+      try {
+        await this.doConnect();
+        return;
+      } catch (err) {
+        if (
+          this.closedByUser ||
+          err instanceof WanderlogAuthError ||
+          attempt >= 1
+        ) {
+          throw err;
+        }
+        // Keep one transient handshake failure from surfacing to the tool,
+        // while leaving longer outages to the background reconnect policy.
+        attempt += 1;
+        await new Promise<void>((resolve) =>
+          setTimeout(resolve, CONNECT_RETRY_DELAY_MS),
+        );
+      }
     }
   }
 
@@ -124,17 +167,38 @@ export class ShareDBClient extends EventEmitter {
       });
       this.ws = ws;
       this.handshakeComplete = false;
+      let settled = false;
+
+      const resolveConnection = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      const rejectConnection = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        reject(err);
+      };
+      const isCurrentSocket = () => this.ws === ws;
 
       const handshakeTimeout = setTimeout(() => {
-        reject(new WanderlogError("ShareDB handshake timeout", "ws_timeout"));
-        ws.close();
+        rejectConnection(
+          new WanderlogError("ShareDB handshake timeout", "ws_timeout"),
+        );
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.close(1011, "handshake timeout");
+        } else if (ws.readyState === WebSocket.CONNECTING) {
+          ws.terminate();
+        }
       }, 10_000);
 
       ws.on("open", () => {
+        if (!isCurrentSocket()) return;
         this.send({ a: "hs", id: null, protocol: 1, protocolMinor: 2 });
       });
 
       ws.on("message", (raw) => {
+        if (!isCurrentSocket()) return;
         const text = raw.toString();
         let msg: unknown;
         try {
@@ -143,19 +207,36 @@ export class ShareDBClient extends EventEmitter {
           return;
         }
         if (!msg || typeof msg !== "object") return;
-        this.handleFrame(msg as Frame & { error?: unknown }, handshakeTimeout, resolve);
+        this.handleFrame(
+          msg as Frame & { error?: unknown },
+          handshakeTimeout,
+          resolveConnection,
+        );
       });
 
       ws.on("close", (code: number) => {
         clearTimeout(handshakeTimeout);
+        if (!isCurrentSocket()) {
+          rejectConnection(new WanderlogError("WebSocket closed", "ws_closed"));
+          return;
+        }
         const wasSubscribed = this.subscribed;
         this.handshakeComplete = false;
         this.subscribed = false;
+        this.ws = undefined;
         this.failAllPending(
           new WanderlogError("WebSocket closed", "ws_closed"),
         );
+        if (!settled) {
+          rejectConnection(
+            new WanderlogError(
+              "WebSocket closed before ShareDB handshake completed",
+              "ws_closed",
+            ),
+          );
+        }
         this.emit("closed", code);
-        if (!this.closedByUser && code !== 1000) {
+        if (!this.closedByUser && code !== 1000 && wasSubscribed) {
           this.scheduleReconnect(wasSubscribed);
         }
       });
@@ -163,9 +244,9 @@ export class ShareDBClient extends EventEmitter {
       ws.on("unexpected-response", (_req, res) => {
         clearTimeout(handshakeTimeout);
         if (res.statusCode === 401 || res.statusCode === 403) {
-          reject(new WanderlogAuthError());
+          rejectConnection(new WanderlogAuthError());
         } else {
-          reject(
+          rejectConnection(
             new WanderlogError(
               `WebSocket upgrade failed: ${res.statusCode}`,
               "ws_upgrade_failed",
@@ -176,7 +257,9 @@ export class ShareDBClient extends EventEmitter {
 
       ws.on("error", (err: Error) => {
         clearTimeout(handshakeTimeout);
-        if (!this.handshakeComplete) reject(err);
+        if (!isCurrentSocket() || !this.handshakeComplete) {
+          rejectConnection(err);
+        }
       });
     });
   }
@@ -233,7 +316,9 @@ export class ShareDBClient extends EventEmitter {
       clearTimeout(handshakeTimeout);
       this.reconnectAttempts = 0;
       const hs = frame as HandshakeAckFrame;
-      if (!this.sessionId && hs.id) this.sessionId = hs.id;
+      // A reconnect creates a new ShareDB session. Keeping the old id makes
+      // later op acknowledgements look like remote ops and eventually time out.
+      if (hs.id) this.sessionId = hs.id;
       connectResolve();
       return;
     }
@@ -242,6 +327,7 @@ export class ShareDBClient extends EventEmitter {
       const pending = this.subscribePending;
       if (pending) {
         this.subscribePending = undefined;
+        clearTimeout(pending.timer);
         pending.resolve(frame as SubscribeAckFrame);
       }
       return;
@@ -275,8 +361,10 @@ export class ShareDBClient extends EventEmitter {
 
   private failAllPending(err: Error): void {
     if (this.subscribePending) {
-      this.subscribePending.reject(err);
+      const pending = this.subscribePending;
       this.subscribePending = undefined;
+      clearTimeout(pending.timer);
+      pending.reject(err);
     }
     for (const [seq, pending] of this.pendingOps) {
       clearTimeout(pending.timer);
@@ -286,7 +374,7 @@ export class ShareDBClient extends EventEmitter {
   }
 
   private scheduleReconnect(resubscribe: boolean): void {
-    if (this.reconnectTimer) return;
+    if (this.reconnectTimer || this.closedByUser) return;
 
     const delay = Math.min(1000 * 2 ** this.reconnectAttempts, 30_000);
     this.reconnectAttempts += 1;
@@ -300,26 +388,32 @@ export class ShareDBClient extends EventEmitter {
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
       if (this.closedByUser) return;
-      this.doConnect()
+      this.connect()
         .then(() => {
           this.reconnectAttempts = 0;
           if (resubscribe) {
-            void this.subscribe().then(() => this.emit("reconnected"));
+            void this.subscribe()
+              .then(() => this.emit("reconnected"))
+              .catch((err) => this.handleReconnectFailure(err, resubscribe));
           } else {
             this.emit("reconnected");
           }
         })
         .catch((err) => {
-          if (err instanceof WanderlogAuthError) {
-            console.error(
-              `[wanderdog] Permanent reconnection failure: Auth expired. Stopping reconnection.`,
-            );
-            this.failAllPending(err);
-            return;
-          }
-          this.scheduleReconnect(resubscribe);
+          this.handleReconnectFailure(err, resubscribe);
         });
     }, delay);
+  }
+
+  private handleReconnectFailure(err: unknown, resubscribe: boolean): void {
+    if (err instanceof WanderlogAuthError) {
+      console.error(
+        `[wanderdog] Permanent reconnection failure: Auth expired. Stopping reconnection.`,
+      );
+      this.failAllPending(err);
+      return;
+    }
+    this.scheduleReconnect(resubscribe);
   }
 
   private send(obj: unknown): void {
@@ -333,19 +427,44 @@ export class ShareDBClient extends EventEmitter {
   }
 
   async subscribe(): Promise<TripPlan> {
+    if (this.subscribed && this.snapshot) return this.snapshot;
+    if (this.subscribePromise) return this.subscribePromise;
+
+    const promise = this.doSubscribe();
+    this.subscribePromise = promise;
+    try {
+      return await promise;
+    } finally {
+      if (this.subscribePromise === promise) this.subscribePromise = undefined;
+    }
+  }
+
+  private async doSubscribe(): Promise<TripPlan> {
     await this.connect();
 
     if (this.subscribed && this.snapshot) return this.snapshot;
 
     const ack = await new Promise<SubscribeAckFrame>((resolve, reject) => {
-      this.subscribePending = { resolve, reject };
-      this.send({ a: "s", c: "TripPlans", d: this.tripKey });
-      setTimeout(() => {
-        if (this.subscribePending) {
-          this.subscribePending = undefined;
-          reject(new WanderlogError("Subscribe timeout", "subscribe_timeout"));
-        }
+      const pending = {
+        resolve,
+        reject,
+        timer: undefined as unknown as NodeJS.Timeout,
+      } satisfies PendingSubscribe;
+      this.subscribePending = pending;
+      pending.timer = setTimeout(() => {
+        if (this.subscribePending !== pending) return;
+        this.subscribePending = undefined;
+        reject(new WanderlogError("Subscribe timeout", "subscribe_timeout"));
       }, 10_000);
+      try {
+        this.send({ a: "s", c: "TripPlans", d: this.tripKey });
+      } catch (err) {
+        if (this.subscribePending === pending) {
+          this.subscribePending = undefined;
+          clearTimeout(pending.timer);
+        }
+        reject(err as Error);
+      }
     });
 
     if (!ack.data) {
@@ -408,15 +527,42 @@ export class ShareDBClient extends EventEmitter {
     });
   }
 
+  /** Drop the local snapshot so the next subscribe fetches a fresh document. */
+  reset(): void {
+    this.subscribed = false;
+    this.handshakeComplete = false;
+    this.snapshot = undefined;
+    this.sessionId = undefined;
+    this._version = 0;
+    this.seqCounter = 0;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+    }
+    this.failAllPending(new WanderlogError("Client reset", "ws_closed"));
+    this.stopSocket();
+  }
+
+  private stopSocket(): void {
+    const ws = this.ws;
+    this.ws = undefined;
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.close();
+    } else if (ws?.readyState === WebSocket.CONNECTING) {
+      ws.terminate();
+    }
+  }
+
   close(): void {
     this.closedByUser = true;
     this.subscribed = false;
+    this.snapshot = undefined;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
     }
     this.failAllPending(new WanderlogError("Client closed", "ws_closed"));
-    this.ws?.close();
+    this.stopSocket();
   }
 }
 
