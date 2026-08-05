@@ -295,11 +295,14 @@ export function findTargetSection(
 }
 
 /** Build a note block matching the shape captured from the Wanderlog UI. */
-export function buildNoteBlock(userId: number): Record<string, unknown> {
+export function buildNoteBlock(
+  userId: number,
+  text = "\n",
+): Record<string, unknown> {
   return {
     id: generateBlockId(),
     type: "note",
-    text: { ops: [{ insert: "\n" }] },
+    text: { ops: [{ insert: text }] },
     addedBy: { type: "user", userId },
     attachments: [],
   };
