@@ -115,16 +115,19 @@ describe("ShareDBClient bare {code, message} rejection frames", () => {
   } {
     const client = new ShareDBClient(config, "tripA");
     const internals = client as unknown as {
+      handshakeComplete: boolean;
       pendingOps: Map<
         number,
         { resolve: () => void; reject: (err: Error) => void; timer: NodeJS.Timeout }
       >;
       handleFrame: (
         frame: Record<string, unknown>,
-        handshakeTimeout: NodeJS.Timeout,
+        handshakeTimeout: NodeJS.Timeout | undefined,
         connectResolve: () => void,
+        connectReject: (err: Error) => void,
       ) => void;
     };
+    internals.handshakeComplete = true;
     const pending = new Promise<void>((resolve, reject) => {
       internals.pendingOps.set(1, {
         resolve,
@@ -140,11 +143,17 @@ describe("ShareDBClient bare {code, message} rejection frames", () => {
       client as unknown as {
         handleFrame: (
           frame: Record<string, unknown>,
-          handshakeTimeout: NodeJS.Timeout,
+          handshakeTimeout: NodeJS.Timeout | undefined,
           connectResolve: () => void,
+          connectReject: (err: Error) => void,
         ) => void;
       }
-    ).handleFrame(frame, setTimeout(() => {}, 60_000), () => {});
+    ).handleFrame(
+      frame,
+      setTimeout(() => {}, 60_000),
+      () => {},
+      () => {},
+    );
   }
 
   it("maps code 4001 to a rate_limited error on pending ops", async () => {

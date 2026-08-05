@@ -142,6 +142,10 @@ export class ShareDBClient extends EventEmitter {
         if (
           this.closedByUser ||
           err instanceof WanderlogAuthError ||
+          (err instanceof WanderlogError &&
+            ["rate_limited", "ws_rejected", "ws_protocol_error"].includes(
+              err.code,
+            )) ||
           attempt >= 1
         ) {
           throw err;
@@ -168,54 +172,108 @@ export class ShareDBClient extends EventEmitter {
       this.ws = ws;
       this.handshakeComplete = false;
       let settled = false;
+      let handshakeSent = false;
+      let connectionTimeout: NodeJS.Timeout | undefined;
+      let handshakeTimeout: NodeJS.Timeout | undefined;
+
+      const clearTimers = () => {
+        if (connectionTimeout) clearTimeout(connectionTimeout);
+        if (handshakeTimeout) clearTimeout(handshakeTimeout);
+        connectionTimeout = undefined;
+        handshakeTimeout = undefined;
+      };
 
       const resolveConnection = () => {
         if (settled) return;
         settled = true;
+        clearTimers();
         resolve();
       };
       const rejectConnection = (err: Error) => {
         if (settled) return;
         settled = true;
+        clearTimers();
+        if (
+          ws.readyState !== WebSocket.CLOSED &&
+          ws.readyState !== WebSocket.CLOSING
+        ) {
+          ws.terminate();
+        }
         reject(err);
       };
       const isCurrentSocket = () => this.ws === ws;
 
-      const handshakeTimeout = setTimeout(() => {
+      connectionTimeout = setTimeout(() => {
         rejectConnection(
-          new WanderlogError("ShareDB handshake timeout", "ws_timeout"),
+          new WanderlogError(
+            "WebSocket connection timeout: the socket did not open",
+            "ws_connect_timeout",
+          ),
         );
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.close(1011, "handshake timeout");
-        } else if (ws.readyState === WebSocket.CONNECTING) {
-          ws.terminate();
-        }
       }, 10_000);
 
       ws.on("open", () => {
-        if (!isCurrentSocket()) return;
-        this.send({ a: "hs", id: null, protocol: 1, protocolMinor: 2 });
+        if (!isCurrentSocket() || settled) return;
+        if (connectionTimeout) clearTimeout(connectionTimeout);
+        connectionTimeout = undefined;
+        handshakeTimeout = setTimeout(() => {
+          rejectConnection(
+            new WanderlogError(
+              "ShareDB initialization timeout: no init frame",
+              "ws_handshake_timeout",
+            ),
+          );
+        }, 10_000);
       });
 
       ws.on("message", (raw) => {
+        // `settled` only means the connection promise has resolved; the same
+        // socket must continue receiving subscription and operation frames.
         if (!isCurrentSocket()) return;
         const text = raw.toString();
         let msg: unknown;
         try {
           msg = JSON.parse(text);
         } catch {
+          if (!this.handshakeComplete) {
+            rejectConnection(
+              new WanderlogError(
+                "Invalid JSON received during ShareDB handshake",
+                "ws_protocol_error",
+              ),
+            );
+          }
           return;
         }
-        if (!msg || typeof msg !== "object") return;
-        this.handleFrame(
-          msg as Frame & { error?: unknown },
-          handshakeTimeout,
-          resolveConnection,
-        );
+        if (!msg || typeof msg !== "object") {
+          if (!this.handshakeComplete) {
+            rejectConnection(
+              new WanderlogError(
+                "Unexpected data received during ShareDB handshake",
+                "ws_protocol_error",
+              ),
+            );
+          }
+          return;
+        }
+        const frame = msg as Frame & { error?: unknown };
+        if (frame.a === "init" && !handshakeSent) {
+          handshakeSent = true;
+          try {
+            // ShareDB's protocol requires the client to wait for the server's
+            // init frame before sending the handshake. Sending hs immediately
+            // after WebSocket open can be silently ignored by the server.
+            this.send({ a: "hs", id: null, protocol: 1, protocolMinor: 2 });
+          } catch (err) {
+            rejectConnection(err as Error);
+            return;
+          }
+        }
+        this.handleFrame(frame, handshakeTimeout, resolveConnection, rejectConnection);
       });
 
       ws.on("close", (code: number) => {
-        clearTimeout(handshakeTimeout);
+        clearTimers();
         if (!isCurrentSocket()) {
           rejectConnection(new WanderlogError("WebSocket closed", "ws_closed"));
           return;
@@ -242,7 +300,6 @@ export class ShareDBClient extends EventEmitter {
       });
 
       ws.on("unexpected-response", (_req, res) => {
-        clearTimeout(handshakeTimeout);
         if (res.statusCode === 401 || res.statusCode === 403) {
           rejectConnection(new WanderlogAuthError());
         } else {
@@ -256,7 +313,6 @@ export class ShareDBClient extends EventEmitter {
       });
 
       ws.on("error", (err: Error) => {
-        clearTimeout(handshakeTimeout);
         if (!isCurrentSocket() || !this.handshakeComplete) {
           rejectConnection(err);
         }
@@ -266,28 +322,37 @@ export class ShareDBClient extends EventEmitter {
 
   private handleFrame(
     frame: Frame & { error?: unknown; seq?: number; code?: number; message?: string },
-    handshakeTimeout: NodeJS.Timeout,
+    handshakeTimeout: NodeJS.Timeout | undefined,
     connectResolve: () => void,
+    connectReject: (err: Error) => void,
   ): void {
     // Server rejections arrive as bare {code, message} frames with no `a` and
-    // no `seq` (observed: {code: 4001, message: "Too many requests"}). Without
-    // this branch they fall through silently and the submit dies as an opaque
-    // 10s timeout. No seq means we can't attribute it — fail everything.
+    // no `seq` (observed: {code: 4001, message: "Too many requests"}). Surface
+    // them immediately; during the handshake they must reject connect(), while
+    // after the handshake no seq means we must fail every pending operation.
     const bare = frame as { a?: string; code?: number; message?: string };
     if (bare.a === undefined && typeof bare.code === "number") {
       const code = bare.code === 4001 ? "rate_limited" : "ws_rejected";
-      this.failAllPending(
-        new WanderlogError(
-          `Wanderlog rejected the request (${bare.code}): ${bare.message ?? "unknown"}`,
-          code,
-        ),
+      const error = new WanderlogError(
+        `Wanderlog rejected the request (${bare.code}): ${bare.message ?? "unknown"}`,
+        code,
       );
+      if (!this.handshakeComplete) {
+        connectReject(error);
+      } else {
+        this.failAllPending(error);
+      }
       return;
     }
 
     if (frame.error) {
       const err = frame.error as string | { message?: string };
       const errMsg = typeof err === "string" ? err : err.message ?? "unknown";
+
+      if (!this.handshakeComplete) {
+        connectReject(new WanderlogError(errMsg, "ws_error"));
+        return;
+      }
 
       // If the error frame carries a seq, it belongs to a specific submit.
       // Fail only that one pending op, so concurrent/queued submits are not
@@ -313,7 +378,7 @@ export class ShareDBClient extends EventEmitter {
 
     if (frame.a === "hs" && !this.handshakeComplete) {
       this.handshakeComplete = true;
-      clearTimeout(handshakeTimeout);
+      if (handshakeTimeout) clearTimeout(handshakeTimeout);
       this.reconnectAttempts = 0;
       const hs = frame as HandshakeAckFrame;
       // A reconnect creates a new ShareDB session. Keeping the old id makes
@@ -335,6 +400,16 @@ export class ShareDBClient extends EventEmitter {
 
     if (frame.a === "op") {
       this.handleOpFrame(frame as OpFrame);
+      return;
+    }
+
+    if (!this.handshakeComplete) {
+      connectReject(
+        new WanderlogError(
+          "Unexpected ShareDB frame during handshake",
+          "ws_protocol_error",
+        ),
+      );
     }
   }
 
@@ -455,6 +530,9 @@ export class ShareDBClient extends EventEmitter {
         if (this.subscribePending !== pending) return;
         this.subscribePending = undefined;
         reject(new WanderlogError("Subscribe timeout", "subscribe_timeout"));
+        // A missing subscribe ack leaves the socket in an unknown state. Do
+        // not reuse it for the next request; force a clean ShareDB session.
+        this.reset();
       }, 10_000);
       try {
         this.send({ a: "s", c: "TripPlans", d: this.tripKey });

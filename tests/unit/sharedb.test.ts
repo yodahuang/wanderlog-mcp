@@ -164,6 +164,71 @@ describe("ShareDBClient reconnect logic", () => {
     expect(doConnectSpy).toHaveBeenCalledTimes(2);
   });
 
+  it("does not retry an explicit rate-limit rejection", async () => {
+    const config = {
+      wsBaseUrl: "wss://test",
+      baseUrl: "https://test",
+      userAgent: "test",
+    } as any;
+    const client = new ShareDBClient(config, "tripA");
+    const rejection = new WanderlogError(
+      "Wanderlog rejected the request (4001): Too many requests",
+      "rate_limited",
+    );
+    const doConnectSpy = vi
+      .spyOn(client as any, "doConnect")
+      .mockRejectedValue(rejection);
+
+    await expect(client.connect()).rejects.toBe(rejection);
+    expect(doConnectSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("surfaces a server rejection received during the handshake", () => {
+    const config = {
+      wsBaseUrl: "wss://test",
+      baseUrl: "https://test",
+      userAgent: "test",
+    } as any;
+    const client = new ShareDBClient(config, "tripA");
+    const connectReject = vi.fn();
+
+    (client as any).handleFrame(
+      { code: 4001, message: "Too many requests" },
+      undefined,
+      vi.fn(),
+      connectReject,
+    );
+
+    expect(connectReject).toHaveBeenCalledOnce();
+    expect(connectReject.mock.calls[0]![0]).toMatchObject({
+      code: "rate_limited",
+      message: "Wanderlog rejected the request (4001): Too many requests",
+    });
+  });
+
+  it("surfaces a protocol error received during the handshake", () => {
+    const config = {
+      wsBaseUrl: "wss://test",
+      baseUrl: "https://test",
+      userAgent: "test",
+    } as any;
+    const client = new ShareDBClient(config, "tripA");
+    const connectReject = vi.fn();
+
+    (client as any).handleFrame(
+      { error: { message: "Handshake rejected" } },
+      undefined,
+      vi.fn(),
+      connectReject,
+    );
+
+    expect(connectReject).toHaveBeenCalledOnce();
+    expect(connectReject.mock.calls[0]![0]).toMatchObject({
+      code: "ws_error",
+      message: "Handshake rejected",
+    });
+  });
+
   it("logs a warning after N consecutive failures (reconnectAttempts > 5)", async () => {
     const config = {
       wsBaseUrl: "wss://test",
@@ -238,9 +303,32 @@ describe("ShareDBClient reconnect logic", () => {
       { a: "s", c: "TripPlans", d: "tripA", data: { v: 1, data: snapshot } },
       undefined as unknown as NodeJS.Timeout,
       () => {},
+      () => {},
     );
 
     await expect(second).resolves.toBe(snapshot);
     client.close();
   });
+
+  it("resets the client when a subscription acknowledgement times out", async () => {
+    const config = {
+      wsBaseUrl: "wss://test",
+      baseUrl: "https://test",
+      userAgent: "test",
+    } as any;
+    const client = new ShareDBClient(config, "tripA");
+    vi.spyOn(client, "connect").mockResolvedValue(undefined);
+    vi.spyOn(client as any, "send").mockImplementation(() => {});
+    const resetSpy = vi.spyOn(client, "reset").mockImplementation(() => {});
+
+    const pending = client.subscribe();
+    const rejection = expect(pending).rejects.toThrow("Subscribe timeout");
+    await Promise.resolve();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    await rejection;
+    expect(resetSpy).toHaveBeenCalledOnce();
+  });
+
 });
