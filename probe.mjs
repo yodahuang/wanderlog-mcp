@@ -29,10 +29,10 @@ const send = (obj) => {
 
 ws.on("open", () => {
   console.log("[probe] open");
-  send({ a: "hs", id: null, protocol: 1, protocolMinor: 2 });
 });
 
 let gotHandshake = false;
+let sentHandshake = false;
 
 ws.on("message", (raw) => {
   const text = raw.toString();
@@ -46,6 +46,10 @@ ws.on("message", (raw) => {
 
   if (msg.a === "init") {
     console.log(`[recv init] session=${msg.id} type=${msg.type}`);
+    if (!sentHandshake) {
+      sentHandshake = true;
+      send({ a: "hs", id: null, protocol: 1, protocolMinor: 2 });
+    }
   } else if (msg.a === "hs" && !gotHandshake) {
     gotHandshake = true;
     console.log(`[recv hs]  session=${msg.id}`);

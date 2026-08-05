@@ -47,7 +47,11 @@ export async function getTrip(
   args: Args,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; isError?: boolean }> {
   try {
-    const trip = await ctx.tripCache.get(args.trip_key);
+    // Reads do not need a live ShareDB subscription. The REST endpoint returns
+    // the complete current trip snapshot and is the same data the Web client
+    // uses to render the itinerary. Keep ShareDB for mutations/live updates,
+    // but do not let a collaboration-socket outage block ordinary reads.
+    const trip = await ctx.rest.getTrip(args.trip_key);
     const daySection = args.day ? resolveDay(trip, args.day) : undefined;
     const text = formatTrip(trip, args.response_format ?? "concise", daySection);
     return { content: [{ type: "text", text }] };
